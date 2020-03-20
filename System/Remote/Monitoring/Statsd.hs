@@ -198,9 +198,12 @@ flushSample sample sendSample opts = do
     isDebug = debug opts
     dottedPrefix = if T.null (prefix opts) then "" else prefix opts <> "."
     dottedSuffix = if T.null (suffix opts) then "" else "." <> suffix opts
-    encodedTags = B8.concat [ B8.concat [ "|#", T.encodeUtf8 tag, ":", T.encodeUtf8 val ]
-                            | (tag, val) <- tags opts
-                            ]
+    encodedTags = if null (tags opts) 
+                    then "" 
+                    else "|#" <> B8.intercalate "," 
+                           [ B8.concat [ T.encodeUtf8 tag, ":", T.encodeUtf8 val ]
+                           | (tag, val) <- tags opts
+                           ]
     send ty name val = do
         let !msg = B8.concat [T.encodeUtf8 name, ":", B8.pack val, ty, encodedTags]
         when isDebug $ B8.hPutStrLn stderr $ B8.concat [ "DEBUG: ", msg]
