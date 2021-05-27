@@ -126,7 +126,7 @@ defaultStatsdOptions = StatsdOptions
 -- | Create a thread that periodically flushes the metrics in the
 -- store to statsd.
 forkStatsd :: StatsdOptions  -- ^ Options
-           -> Metrics.Store  -- ^ Metric store
+           -> Metrics.Store metrics -- ^ Metric store
            -> IO Statsd      -- ^ Statsd sync handle
 forkStatsd opts store = do
     addrInfos <- Socket.getAddrInfo Nothing (Just $ T.unpack $ host opts)
@@ -186,48 +186,54 @@ flushSample :: Metrics.Sample -> (B8.ByteString -> IO ()) -> StatsdOptions -> M.
 flushSample sample sendSample opts priorCounts =
     foldM flushOne priorCounts (M.toList sample)
   where
-    flushOne pc (name, val) =
+    flushOne pc (Metrics.Identifier name tags, val) =
       let fullName = dottedPrefix <> sanitizeName name <> dottedSuffix
-      in  flushMetric fullName val pc
+      in  flushMetric fullName tags val pc
 
     sanitizeName = T.map sanitizeChar
     sanitizeChar ':' = '_'
     sanitizeChar c   = c
 
-    flushMetric name (Metrics.Counter n)      pc = sendCounter name n pc
-    flushMetric name (Metrics.Gauge n)        pc = sendGauge name n >> return pc
-    flushMetric name (Metrics.Distribution d) pc = sendDistribution name d pc
-    flushMetric _    (Metrics.Label _)        pc = return pc
+    flushMetric name tags (Metrics.Counter n)      pc = sendCounter name tags n pc
+    flushMetric name tags (Metrics.Gauge n)        pc = sendGauge name tags n >> return pc
+    flushMetric name tags (Metrics.Distribution d) pc = sendDistribution name tags d pc
+    flushMetric _    _    (Metrics.Label _)        pc = return pc
 
-    sendGauge name n = send "|g" name (show n)
+    sendGauge name tags n = send "|g" name tags (show n)
 
     -- The statsd convention is to send only the increment
     -- since the last report, not the total count.
-    sendCounter name n pc = do
+    sendCounter name tags n pc = do
       let old = fromMaybe 0 (M.lookup name pc)
-      send "|c" name (show (n - old))
+      send "|c" name tags (show (n - old))
       return (M.insert name n pc)
 
-    sendDistribution name d pc = do
-      sendGauge         (name <> "." <> "mean"    ) (Distribution.mean     d)
-      sendGauge         (name <> "." <> "variance") (Distribution.variance d)
-      uc <- sendCounter (name <> "." <> "count"   ) (Distribution.count    d) pc
-      sendGauge         (name <> "." <> "sum"     ) (Distribution.sum      d)
-      sendGauge         (name <> "." <> "min"     ) (Distribution.min      d)
-      sendGauge         (name <> "." <> "max"     ) (Distribution.max      d)
+    sendDistribution name tags d pc = do
+      sendGauge         (name <> "." <> "mean"    ) tags (Distribution.mean     d)
+      sendGauge         (name <> "." <> "variance") tags (Distribution.variance d)
+      uc <- sendCounter (name <> "." <> "count"   ) tags (Distribution.count    d) pc
+      sendGauge         (name <> "." <> "sum"     ) tags (Distribution.sum      d)
+      sendGauge         (name <> "." <> "min"     ) tags (Distribution.min      d)
+      sendGauge         (name <> "." <> "max"     ) tags (Distribution.max      d)
       return uc
 
     isDebug = debug opts
     dottedPrefix = if T.null (prefix opts) then "" else prefix opts <> "."
     dottedSuffix = if T.null (suffix opts) then "" else "." <> suffix opts
-    encodedTags = if null (tags opts) 
-                    then "" 
-                    else "|#" <> B8.intercalate "," 
-                           [ B8.concat [ T.encodeUtf8 tag, ":", T.encodeUtf8 val ]
-                           | (tag, val) <- tags opts
-                           ]
-    send ty name val = do
-        let !msg = B8.concat [T.encodeUtf8 name, ":", B8.pack val, ty, encodedTags]
+
+    encodedTags :: M.HashMap T.Text T.Text -> B8.ByteString
+    encodedTags metricTags =
+      let fullTags = tags opts ++ M.toList metricTags
+      in  if null fullTags
+            then ""
+            else "|#" <> B8.intercalate ","
+                    [ B8.concat [ T.encodeUtf8 tag, ":", T.encodeUtf8 val ]
+                    | (tag, val) <- fullTags
+                    ]
+
+    send ty name tags val = do
+        let !msg = B8.concat
+              [T.encodeUtf8 name, ":", B8.pack val, ty, encodedTags tags]
         when isDebug $ B8.hPutStrLn stderr $ B8.concat [ "DEBUG: ", msg]
         sendSample msg `catch` \ (e :: IOException) -> do
             T.hPutStrLn stderr $ "ERROR: Couldn't send message: " <>
