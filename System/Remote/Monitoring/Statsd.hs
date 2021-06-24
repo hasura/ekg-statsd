@@ -13,6 +13,9 @@
 -- You probably want to include some of the predefined metrics defined
 -- in the ekg-core package, by calling e.g. the 'registerGcStats'
 -- function defined in that package.
+--
+-- Note that the StatsD protocol does not allow @':'@ in metric names, so
+-- any occurrences are replaced by @'_'@.
 module System.Remote.Monitoring.Statsd
     (
       -- * The statsd syncer
@@ -25,11 +28,13 @@ module System.Remote.Monitoring.Statsd
     ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay, throwTo)
+import Control.Concurrent.MVar (modifyMVar_, newMVar)
 import Control.Exception (IOException, AsyncException(ThreadKilled), catch, fromException)
-import Control.Monad (forM_, when)
+import Control.Monad (foldM, when)
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.HashMap.Strict as M
 import Data.Int (Int64)
+import Data.Maybe (fromMaybe)
 import Data.Monoid ((<>))
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -121,7 +126,7 @@ defaultStatsdOptions = StatsdOptions
 -- | Create a thread that periodically flushes the metrics in the
 -- store to statsd.
 forkStatsd :: StatsdOptions  -- ^ Options
-           -> Metrics.Store  -- ^ Metric store
+           -> Metrics.Store metrics -- ^ Metric store
            -> IO Statsd      -- ^ Statsd sync handle
 forkStatsd opts store = do
     addrInfos <- Socket.getAddrInfo Nothing (Just $ T.unpack $ host opts)
@@ -143,9 +148,10 @@ forkStatsd opts store = do
 
             return (sendSample, Socket.close socket)
 
+    priorCountsVar <- newMVar M.empty
     let flush = do
           sample <- Metrics.sampleAll store
-          flushSample sample sendSample opts
+          modifyMVar_ priorCountsVar (flushSample sample sendSample opts)
 
     me <- myThreadId
     tid <- forkFinally (loop opts flush) $ \ r -> do
@@ -176,36 +182,58 @@ time :: IO Int64
 time = (round . (* 1000000.0) . toDouble) `fmap` getPOSIXTime
   where toDouble = realToFrac :: Real a => a -> Double
 
-flushSample :: Metrics.Sample -> (B8.ByteString -> IO ()) -> StatsdOptions -> IO ()
-flushSample sample sendSample opts = do
-    forM_ (M.toList sample) $ \ (name, val) ->
-        let fullName = dottedPrefix <> name <> dottedSuffix
-        in  flushMetric fullName val
+flushSample :: Metrics.Sample -> (B8.ByteString -> IO ()) -> StatsdOptions -> M.HashMap T.Text Int64 -> IO (M.HashMap T.Text Int64)
+flushSample sample sendSample opts priorCounts =
+    foldM flushOne priorCounts (M.toList sample)
   where
-    flushMetric name (Metrics.Counter n)      = send "|c" name (show n)
-    flushMetric name (Metrics.Gauge n)        = send "|g" name (show n)
-    flushMetric name (Metrics.Distribution d) = sendDistribution name d
-    flushMetric _    (Metrics.Label _)        = return ()
+    flushOne pc (Metrics.Identifier name tags, val) =
+      let fullName = dottedPrefix <> sanitizeName name <> dottedSuffix
+      in  flushMetric fullName tags val pc
 
-    sendDistribution name d = do
-      send "|g" (name <> "." <> "mean"    ) (show $ Distribution.mean     d)
-      send "|g" (name <> "." <> "variance") (show $ Distribution.variance d)
-      send "|c" (name <> "." <> "count"   ) (show $ Distribution.count    d)
-      send "|g" (name <> "." <> "sum"     ) (show $ Distribution.sum      d)
-      send "|g" (name <> "." <> "min"     ) (show $ Distribution.min      d)
-      send "|g" (name <> "." <> "max"     ) (show $ Distribution.max      d)
+    sanitizeName = T.map sanitizeChar
+    sanitizeChar ':' = '_'
+    sanitizeChar c   = c
+
+    flushMetric name tags (Metrics.Counter n)      pc = sendCounter name tags n pc
+    flushMetric name tags (Metrics.Gauge n)        pc = sendGauge name tags n >> return pc
+    flushMetric name tags (Metrics.Distribution d) pc = sendDistribution name tags d pc
+    flushMetric _    _    (Metrics.Label _)        pc = return pc
+
+    sendGauge name tags n = send "|g" name tags (show n)
+
+    -- The statsd convention is to send only the increment
+    -- since the last report, not the total count.
+    sendCounter name tags n pc = do
+      let old = fromMaybe 0 (M.lookup name pc)
+      send "|c" name tags (show (n - old))
+      return (M.insert name n pc)
+
+    sendDistribution name tags d pc = do
+      sendGauge         (name <> "." <> "mean"    ) tags (Distribution.mean     d)
+      sendGauge         (name <> "." <> "variance") tags (Distribution.variance d)
+      uc <- sendCounter (name <> "." <> "count"   ) tags (Distribution.count    d) pc
+      sendGauge         (name <> "." <> "sum"     ) tags (Distribution.sum      d)
+      sendGauge         (name <> "." <> "min"     ) tags (Distribution.min      d)
+      sendGauge         (name <> "." <> "max"     ) tags (Distribution.max      d)
+      return uc
 
     isDebug = debug opts
     dottedPrefix = if T.null (prefix opts) then "" else prefix opts <> "."
     dottedSuffix = if T.null (suffix opts) then "" else "." <> suffix opts
-    encodedTags = if null (tags opts) 
-                    then "" 
-                    else "|#" <> B8.intercalate "," 
-                           [ B8.concat [ T.encodeUtf8 tag, ":", T.encodeUtf8 val ]
-                           | (tag, val) <- tags opts
-                           ]
-    send ty name val = do
-        let !msg = B8.concat [T.encodeUtf8 name, ":", B8.pack val, ty, encodedTags]
+
+    encodedTags :: M.HashMap T.Text T.Text -> B8.ByteString
+    encodedTags metricTags =
+      let fullTags = tags opts ++ M.toList metricTags
+      in  if null fullTags
+            then ""
+            else "|#" <> B8.intercalate ","
+                    [ B8.concat [ T.encodeUtf8 tag, ":", T.encodeUtf8 val ]
+                    | (tag, val) <- fullTags
+                    ]
+
+    send ty name tags val = do
+        let !msg = B8.concat
+              [T.encodeUtf8 name, ":", B8.pack val, ty, encodedTags tags]
         when isDebug $ B8.hPutStrLn stderr $ B8.concat [ "DEBUG: ", msg]
         sendSample msg `catch` \ (e :: IOException) -> do
             T.hPutStrLn stderr $ "ERROR: Couldn't send message: " <>
