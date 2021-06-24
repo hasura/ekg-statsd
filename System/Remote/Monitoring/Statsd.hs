@@ -98,6 +98,9 @@ data StatsdOptions = StatsdOptions
       -- @takeWhile (/= \'.\') \<$\> getHostName@, using @getHostName@
       -- from the @Network.BSD@ module in the network package.
     , suffix :: !T.Text
+    
+    -- | Tags, for implementations such as Datadog which support them.
+    , tags :: ![(T.Text, T.Text)]
     }
 
 -- | Defaults:
@@ -117,6 +120,7 @@ defaultStatsdOptions = StatsdOptions
     , debug         = False
     , prefix        = ""
     , suffix        = ""
+    , tags          = []
     }
 
 -- | Create a thread that periodically flushes the metrics in the
@@ -216,8 +220,14 @@ flushSample sample sendSample opts priorCounts =
     isDebug = debug opts
     dottedPrefix = if T.null (prefix opts) then "" else prefix opts <> "."
     dottedSuffix = if T.null (suffix opts) then "" else "." <> suffix opts
+    encodedTags = if null (tags opts) 
+                    then "" 
+                    else "|#" <> B8.intercalate "," 
+                           [ B8.concat [ T.encodeUtf8 tag, ":", T.encodeUtf8 val ]
+                           | (tag, val) <- tags opts
+                           ]
     send ty name val = do
-        let !msg = B8.concat [T.encodeUtf8 name, ":", B8.pack val, ty]
+        let !msg = B8.concat [T.encodeUtf8 name, ":", B8.pack val, ty, encodedTags]
         when isDebug $ B8.hPutStrLn stderr $ B8.concat [ "DEBUG: ", msg]
         sendSample msg `catch` \ (e :: IOException) -> do
             T.hPutStrLn stderr $ "ERROR: Couldn't send message: " <>
